@@ -2,6 +2,8 @@ import { z } from "zod"
 import { prisma } from "../../lib/prisma"
 import { FastifyInstance } from "fastify"
 import { randomUUID } from "crypto"
+import { redis } from "../../lib/redis"
+import { voting } from "../../utils/voting-pub-sub"
 
 export async function voteOnPoll(app: FastifyInstance) {
     app.post('/polls/:pollId/votes', async (request, reply) => {
@@ -12,10 +14,10 @@ export async function voteOnPoll(app: FastifyInstance) {
         const voteonPollParams = z.object({
             pollId: z.string().uuid()
         })
-    
+
         const { pollOptionId } = voteOnPollBody.parse(request.body)
         const { pollId } = voteonPollParams.parse(request.params)
-    
+
         let { sessionId } = request.cookies
 
         if (sessionId) {
@@ -28,24 +30,31 @@ export async function voteOnPoll(app: FastifyInstance) {
                 }
             })
 
-            if(userPreviousVoteOnPoll && userPreviousVoteOnPoll.pollOptionId !== pollOptionId) {
+            if (userPreviousVoteOnPoll && userPreviousVoteOnPoll.pollOptionId !== pollOptionId) {
                 await prisma.vote.delete({
                     where: {
                         id: userPreviousVoteOnPoll.id
                     }
                 })
-            } else if (userPreviousVoteOnPoll){
-                return reply.status(400).send({"message":"You already vote on this poll."})
+                const votes = await redis.zincrby(pollId, -1, userPreviousVoteOnPoll.pollOptionId)
+
+                voting.publish(pollId, {
+                    pollOptionId: userPreviousVoteOnPoll.pollOptionId,
+                    votes: Number(votes)
+                })
+
+            } else if (userPreviousVoteOnPoll) {
+                return reply.status(400).send({ "message": "You already vote on this poll." })
             }
         }
 
 
         if (!sessionId) {
             sessionId = randomUUID()
-    
+
             reply.setCookie('sessionId', sessionId, {
                 path: '/',
-                maxAge: 60 * 60 * 24* 30,
+                maxAge: 60 * 60 * 24 * 30,
                 signed: true,
                 httpOnly: true
             })
@@ -59,7 +68,13 @@ export async function voteOnPoll(app: FastifyInstance) {
             }
         })
 
+        const votes = await redis.zincrby(pollId, 1, pollOptionId)
 
-        return reply.status(201).send({sessionId})
+        voting.publish(pollId, {
+            pollOptionId,
+            votes: Number(votes)
+        })
+
+        return reply.status(201).send({ sessionId })
     })
 }
